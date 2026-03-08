@@ -43,45 +43,52 @@ class KaikoAPI:
             date = pd.to_datetime(date)
         return date.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
 
-    def get_spot_price(self, base: str, quote: str) -> float:
+    def get_spot_price(self, base: str, quote: str) -> Optional[float]:
         """
-        Fetch current spot price from Kaiko OHLCV endpoint.
+        Fetch current spot price from Kaiko OHLCV endpoint with multiple fallbacks.
 
         Args:
-            base: Base asset (e.g., 'btc')
+            base: Base asset (e.g., 'btc', 'eth')
             quote: Quote currency (e.g., 'usd')
 
         Returns:
             Current spot price as float, or None if unavailable
         """
-        # Try multiple exchanges for spot price
-        exchanges = ['cbse', 'krkn', 'bnce']  # Coinbase, Kraken, Binance
+        # Try multiple exchanges, intervals, and lookback strategies
+        exchanges = ['cbse', 'krkn', 'bnce', 'bfnx']  # Coinbase, Kraken, Binance, Bitfinex
+        intervals = ['1m', '5m', '15m', '1h']
+        
+        for interval in intervals:
+            for exchange in exchanges:
+                try:
+                    url = f"{self.base_url}/v2/data/trades.v1/exchanges/{exchange}/spot/{base}-{quote}/aggregations/count_ohlcv_vwap"
+                    params = {
+                        'page_size': 20,  # Look back further
+                        'sort': 'desc',
+                        'interval': interval
+                    }
 
-        for exchange in exchanges:
-            try:
-                url = f"{self.base_url}/v2/data/trades.v1/exchanges/{exchange}/spot/{base}-{quote}/aggregations/count_ohlcv_vwap"
-                params = {
-                    'page_size': 1,
-                    'sort': 'desc',
-                    'interval': '1m'
-                }
+                    response = requests.get(url, headers=self.headers, params=params, timeout=10)
+                    response.raise_for_status()
+                    data = response.json()
 
-                response = requests.get(url, headers=self.headers, params=params, timeout=10)
-                response.raise_for_status()
-                data = response.json()
+                    result = data.get('data', [])
+                    if result and len(result) > 0:
+                        # Find first valid price
+                        for candle in result:
+                            price = candle.get('price')
+                            if price:
+                                try:
+                                    price_float = float(price)
+                                    if price_float > 0:
+                                        return price_float
+                                except (ValueError, TypeError):
+                                    continue
 
-                result = data.get('data', [])
-                if result and len(result) > 0:
-                    # Use VWAP as spot price
-                    price = result[0].get('price')
-                    if price:
-                        return float(price)
-
-            except Exception as e:
-                continue  # Try next exchange
-
-        # If all exchanges fail, return None
-        print(f"Could not fetch spot price for {base}-{quote}")
+                except Exception as e:
+                    continue  # Try next exchange/interval
+        
+        # All attempts failed
         return None
 
     def get_instruments(self, base: str, quote: str, start_date: datetime,
@@ -123,7 +130,7 @@ class KaikoAPI:
             return df
 
         except requests.exceptions.RequestException as e:
-            st.error(f"Error fetching instruments: {e}")
+            print(f"Error fetching instruments: {e}")
             return pd.DataFrame()
 
     def get_expiries(self, base: str, quote: str, start_date: datetime,
@@ -239,7 +246,6 @@ class KaikoAPI:
             exchange: Exchange code (default: 'drbt')
             max_instruments: Limit number of instruments (for testing/speed)
             atm_filter_pct: If set, only fetch strikes within this % of estimated ATM
-                           (e.g., 0.2 = ±20% from ATM). Speeds up fetching significantly.
 
         Returns:
             DataFrame with columns: instrument, strike_price, option_type, expiry,
@@ -259,20 +265,19 @@ class KaikoAPI:
         if instruments_df.empty:
             return pd.DataFrame()
 
-        # ATM Filter: Only fetch strikes near current price
+        # ATM Filter
         if atm_filter_pct and 'strike_price' in instruments_df.columns:
             instruments_df['strike_price_num'] = pd.to_numeric(instruments_df['strike_price'], errors='coerce')
             instruments_df = instruments_df[instruments_df['strike_price_num'].notna()]
 
             if not instruments_df.empty:
-                # Estimate ATM as median strike
                 estimated_atm = instruments_df['strike_price_num'].median()
                 lower_bound = estimated_atm * (1 - atm_filter_pct)
                 upper_bound = estimated_atm * (1 + atm_filter_pct)
 
-                instruments_df = instruments_df[\
-                    (instruments_df['strike_price_num'] >= lower_bound) &\
-                    (instruments_df['strike_price_num'] <= upper_bound)\
+                instruments_df = instruments_df[
+                    (instruments_df['strike_price_num'] >= lower_bound) &
+                    (instruments_df['strike_price_num'] <= upper_bound)
                 ]
 
         if max_instruments:
@@ -283,22 +288,16 @@ class KaikoAPI:
         if total == 0:
             return pd.DataFrame()
 
-        # Parallel fetching with ThreadPoolExecutor
+        # Parallel fetching
         risk_data = []
-        completed = 0
 
-        # Use 10 parallel workers (adjust based on API rate limits)
         with ThreadPoolExecutor(max_workers=10) as executor:
-            # Submit all tasks
             future_to_row = {
                 executor.submit(self._fetch_single_instrument_risk, row, exchange): idx
                 for idx, row in instruments_df.iterrows()
             }
 
-            # Process completed tasks as they finish
             for future in as_completed(future_to_row):
-                completed += 1
-
                 result = future.result()
                 if result:
                     risk_data.append(result)
@@ -349,120 +348,4 @@ class KaikoAPI:
         if all_data:
             return pd.concat(all_data, ignore_index=True)
         else:
-            return pd.DataFrame()
-
-    def get_kaiko_iv_smile(self, base: str, quote: str, value_time: str, 
-                        expiry: str, strikes: List[float] = None, 
-                        exchange: str = 'drbt') -> Dict[str, Any]:
-        """
-        Fetch Kaiko's proprietary IV smile calculation for specific strikes.
-        
-        Args:
-            base: Asset (btc, eth, sol, xrp)
-            quote: Quote currency (usd, usdc)
-            value_time: Valuation timestamp (ISO format)
-            expiry: Option expiry (ISO format)
-            strikes: List of strike prices to calculate IV for
-            exchange: Exchange code (default: drbt)
-        
-        Returns:
-            Dictionary with IV smile data
-        """
-        url = f"{self.base_url}/v2/data/analytics.v2/implied_volatility_smile"
-        
-        if strikes and len(strikes) > 0:
-            # Use specific strikes
-            strikes_str = ",".join([str(int(s)) for s in sorted(strikes)])
-            
-            params = {
-                'base': base,
-                'quote': quote,
-                'value_time': value_time,
-                'expiry': expiry,
-                'exchanges': exchange,
-                'strikes': strikes_str
-            }
-        else:
-            # Fallback to deltas if no strikes provided
-            deltas = ",".join([str(round(d, 2)) for d in np.arange(0.05, 1.0, 0.05)])
-            
-            params = {
-                'base': base,
-                'quote': quote,
-                'value_time': value_time,
-                'expiry': expiry,
-                'exchanges': exchange,
-                'deltas': deltas
-            }
-        
-        try:
-            response = requests.get(url, headers=self.headers, params=params, timeout=30)
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            print(f"Error fetching Kaiko IV smile: {e}")
-            return {'data': []}
-
-    def get_iv_surface(self, base: str, quote: str, value_time: datetime,
-                      tte_min: float = 0.01, tte_max: float = 1.0,
-                      tte_step: float = 0.02) -> pd.DataFrame:
-        """
-        Fetch IV surface data from Kaiko API using delta grid.
-
-        Args:
-            base: Base currency (e.g., 'btc')
-            quote: Quote currency (e.g., 'usd')
-            value_time: Timestamp for the surface
-            tte_min: Minimum time to expiry in years
-            tte_max: Maximum time to expiry in years
-            tte_step: Step size for time to expiry
-
-        Returns:
-            DataFrame with IV surface data
-        """
-        delta_min = 0.1
-        delta_max = 0.9
-        delta_step = 0.1
-
-        value_time_str = value_time.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
-
-        url = f"{self.base_url}/v2/data/analytics.v2/implied_volatility_surface"
-        params = {
-            "base": base,
-            "quote": quote,
-            "exchanges": "drbt",
-            "value_time": value_time_str,
-            "tte_min": tte_min,
-            "tte_max": tte_max,
-            "tte_step": tte_step,
-            "delta_min": delta_min,
-            "delta_max": delta_max,
-            "delta_step": delta_step
-        }
-
-        try:
-            response = requests.get(url, headers=self.headers, params=params, timeout=30)
-            response.raise_for_status()
-            data = response.json()
-
-            rows = []
-            for surface in data.get("data", []):
-                expiry = surface.get("expiry")
-                tte = surface.get("time_to_expiry")
-
-                for point in surface.get("implied_volatilities", []):
-                    rows.append({
-                        "delta": point.get("delta"),
-                        "implied_volatility": point.get("implied_volatility"),
-                        "time_to_expiry": tte,
-                        "expiry": expiry
-                    })
-
-            if rows:
-                return pd.DataFrame(rows)
-            else:
-                return pd.DataFrame()
-
-        except Exception as e:
-            st.error(f"Error fetching IV surface: {e}")
             return pd.DataFrame()

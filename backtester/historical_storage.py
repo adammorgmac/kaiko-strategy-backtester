@@ -1,5 +1,6 @@
 """
 Store and retrieve historical options snapshots for backtesting.
+SQLite database with proper type handling and error management.
 """
 import pandas as pd
 import sqlite3
@@ -73,6 +74,11 @@ class HistoricalStorage:
             ON options_data(snapshot_id)
         """)
         
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_options_instrument
+            ON options_data(instrument)
+        """)
+        
         conn.commit()
         conn.close()
     
@@ -89,49 +95,85 @@ class HistoricalStorage:
                 INSERT OR REPLACE INTO snapshots 
                 (asset, snapshot_date, spot_price, num_instruments)
                 VALUES (?, ?, ?, ?)
-            """, (asset, snapshot_date, spot_price, len(data)))
+            """, (asset, str(snapshot_date), float(spot_price), len(data)))
             
-            snapshot_id = cursor.lastrowid
+            # Get the snapshot ID
+            cursor.execute("""
+                SELECT id FROM snapshots 
+                WHERE asset = ? AND snapshot_date = ?
+            """, (asset, str(snapshot_date)))
             
-            # Delete existing options data for this snapshot
+            result = cursor.fetchone()
+            if not result:
+                conn.rollback()
+                print(f"✗ Failed to retrieve snapshot ID for {asset}")
+                return
+            
+            snapshot_id = result[0]
+            
+            # Delete existing options data for this snapshot (in case of re-run)
             cursor.execute("""
                 DELETE FROM options_data 
                 WHERE snapshot_id = ?
             """, (snapshot_id,))
             
-            # Insert options data
+            # Prepare data for insertion
+            data = data.copy()
+            
+            # Convert timestamps to strings
+            if 'expiry' in data.columns:
+                data['expiry'] = data['expiry'].astype(str)
+            
+            # Insert options data row by row
+            inserted = 0
             for _, row in data.iterrows():
-                cursor.execute("""
-                    INSERT INTO options_data
-                    (snapshot_id, instrument, strike_price, option_type, expiry,
-                     mark_iv, bid_iv, ask_iv, delta, gamma, vega, theta, rho, open_interest)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    snapshot_id,
-                    row.get('instrument'),
-                    row.get('strike_price'),
-                    row.get('option_type'),
-                    row.get('expiry'),
-                    row.get('mark_iv'),
-                    row.get('bid_iv'),
-                    row.get('ask_iv'),
-                    row.get('delta'),
-                    row.get('gamma'),
-                    row.get('vega'),
-                    row.get('theta'),
-                    row.get('rho'),
-                    row.get('open_interest')
-                ))
+                try:
+                    cursor.execute("""
+                        INSERT INTO options_data
+                        (snapshot_id, instrument, strike_price, option_type, expiry,
+                         mark_iv, bid_iv, ask_iv, delta, gamma, vega, theta, rho, open_interest)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        snapshot_id,
+                        str(row.get('instrument', '')),
+                        self._to_float(row.get('strike_price')),
+                        str(row.get('option_type', '')),
+                        str(row.get('expiry', '')),
+                        self._to_float(row.get('mark_iv')),
+                        self._to_float(row.get('bid_iv')),
+                        self._to_float(row.get('ask_iv')),
+                        self._to_float(row.get('delta')),
+                        self._to_float(row.get('gamma')),
+                        self._to_float(row.get('vega')),
+                        self._to_float(row.get('theta')),
+                        self._to_float(row.get('rho')),
+                        self._to_float(row.get('open_interest'))
+                    ))
+                    inserted += 1
+                except Exception as e:
+                    print(f"  Warning: Failed to insert row for {row.get('instrument')}: {e}")
+                    continue
             
             conn.commit()
-            print(f"✓ Saved snapshot: {asset} on {snapshot_date} ({len(data)} instruments)")
+            print(f"✓ Saved snapshot: {asset} on {snapshot_date} ({inserted}/{len(data)} instruments)")
             
         except Exception as e:
             conn.rollback()
             print(f"✗ Error saving snapshot: {e}")
+            import traceback
+            traceback.print_exc()
         
         finally:
             conn.close()
+    
+    def _to_float(self, value) -> Optional[float]:
+        """Safely convert value to float, returning None if invalid."""
+        if value is None or pd.isna(value):
+            return None
+        try:
+            return float(value)
+        except (ValueError, TypeError):
+            return None
     
     def get_snapshot(self, asset: str, date: str) -> Optional[pd.DataFrame]:
         """Retrieve a specific snapshot by date."""
@@ -154,13 +196,24 @@ class HistoricalStorage:
             
             # Get options data
             query = """
-                SELECT * FROM options_data
+                SELECT 
+                    instrument, strike_price, option_type, expiry,
+                    mark_iv, bid_iv, ask_iv,
+                    delta, gamma, vega, theta, rho,
+                    open_interest
+                FROM options_data
                 WHERE snapshot_id = ?
             """
             
             df = pd.read_sql_query(query, conn, params=(snapshot_id,))
-            df['spot_price'] = spot_price
-            df['snapshot_date'] = date
+            
+            if not df.empty:
+                df['spot_price'] = spot_price
+                df['snapshot_date'] = date
+                df['snapshot_timestamp'] = pd.Timestamp(date, tz='UTC')
+                
+                # Convert expiry back to datetime
+                df['expiry'] = pd.to_datetime(df['expiry'], utc=True, errors='coerce')
             
             return df
             
@@ -176,7 +229,10 @@ class HistoricalStorage:
                 SELECT 
                     s.snapshot_date,
                     s.spot_price,
-                    o.*
+                    o.instrument, o.strike_price, o.option_type, o.expiry,
+                    o.mark_iv, o.bid_iv, o.ask_iv,
+                    o.delta, o.gamma, o.vega, o.theta, o.rho,
+                    o.open_interest
                 FROM snapshots s
                 JOIN options_data o ON s.id = o.snapshot_id
                 WHERE s.asset = ?
@@ -189,6 +245,11 @@ class HistoricalStorage:
                 conn, 
                 params=(asset, start_date, end_date)
             )
+            
+            if not df.empty:
+                # Convert timestamp columns
+                df['snapshot_timestamp'] = pd.to_datetime(df['snapshot_date'], utc=True)
+                df['expiry'] = pd.to_datetime(df['expiry'], utc=True, errors='coerce')
             
             return df
             
@@ -212,7 +273,7 @@ class HistoricalStorage:
                 query = """
                     SELECT asset, snapshot_date, spot_price, num_instruments, created_at
                     FROM snapshots
-                    ORDER BY snapshot_date DESC
+                    ORDER BY snapshot_date DESC, asset
                 """
                 df = pd.read_sql_query(query, conn)
             
@@ -249,10 +310,46 @@ class HistoricalStorage:
             return {
                 'num_snapshots': num_snapshots,
                 'num_datapoints': num_datapoints,
-                'date_range': date_range,
+                'date_range': date_range if date_range else (None, None),
                 'assets': assets
             }
             
+        finally:
+            conn.close()
+    
+    def delete_snapshot(self, asset: str, date: str) -> bool:
+        """Delete a specific snapshot."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        try:
+            # Get snapshot ID
+            cursor.execute("""
+                SELECT id FROM snapshots
+                WHERE asset = ? AND snapshot_date = ?
+            """, (asset, date))
+            
+            result = cursor.fetchone()
+            if not result:
+                return False
+            
+            snapshot_id = result[0]
+            
+            # Delete options data
+            cursor.execute("DELETE FROM options_data WHERE snapshot_id = ?", (snapshot_id,))
+            
+            # Delete snapshot
+            cursor.execute("DELETE FROM snapshots WHERE id = ?", (snapshot_id,))
+            
+            conn.commit()
+            print(f"✓ Deleted snapshot: {asset} on {date}")
+            return True
+            
+        except Exception as e:
+            conn.rollback()
+            print(f"✗ Error deleting snapshot: {e}")
+            return False
+        
         finally:
             conn.close()
 
@@ -282,6 +379,8 @@ class BacktestRunner:
         Returns:
             Backtest results dictionary
         """
+        from .strategies import SignalType  # Import here to avoid circular dependency
+        
         print(f"\n{'='*70}")
         print(f"BACKTESTING: {strategy.name}")
         print(f"{'='*70}")
@@ -299,29 +398,32 @@ class BacktestRunner:
         
         # Group by date and run strategy on each day
         all_signals = []
-        daily_pnl = []
         
         for date in sorted(historical_data['snapshot_date'].unique()):
             day_data = historical_data[historical_data['snapshot_date'] == date].copy()
             
-            # Create spot data (simplified)
+            # Create spot data
             spot_price = day_data['spot_price'].iloc[0]
             spot_data = pd.DataFrame({
-                'timestamp': [pd.Timestamp(date)],
+                'timestamp': [pd.Timestamp(date, tz='UTC')],
                 'price': [spot_price]
             })
             
             # Add timestamp to market data
-            day_data['timestamp'] = pd.Timestamp(date)
+            day_data['timestamp'] = pd.Timestamp(date, tz='UTC')
             
             # Generate signals
-            signals = strategy.generate_signals(day_data, spot_data)
-            
-            if signals:
-                print(f"  {date}: Generated {len(signals)} signals @ ${spot_price:,.0f}")
-                all_signals.extend(signals)
+            try:
+                signals = strategy.generate_signals(day_data, spot_data)
+                
+                if signals:
+                    print(f"  {date}: Generated {len(signals)} signals @ ${spot_price:,.0f}")
+                    all_signals.extend(signals)
+            except Exception as e:
+                print(f"  {date}: Error generating signals: {e}")
+                continue
         
-        # Calculate performance (simplified)
+        # Calculate performance
         print(f"\n{'='*70}")
         print("BACKTEST RESULTS")
         print(f"{'='*70}")
@@ -334,7 +436,7 @@ class BacktestRunner:
             print(f"BUY Signals: {len(buy_signals)}")
             print(f"SELL Signals: {len(sell_signals)}")
             
-            # Group by instrument
+            # Create signals DataFrame
             signal_df = pd.DataFrame([{
                 'timestamp': s.timestamp,
                 'action': s.signal_type.name,
@@ -347,62 +449,43 @@ class BacktestRunner:
             
             print(f"\nSignal Distribution:")
             print(signal_df.groupby(['action', 'option_type']).size())
+        else:
+            signal_df = pd.DataFrame()
         
         return {
             'signals': all_signals,
-            'signal_df': signal_df if all_signals else pd.DataFrame(),
+            'signal_df': signal_df,
             'num_signals': len(all_signals),
-            'date_range': (start_date, end_date)
+            'date_range': (start_date, end_date),
+            'num_days': historical_data['snapshot_date'].nunique()
         }
 
 
 # CLI tool for capturing daily snapshots
-def capture_daily_snapshot(asset: str = 'btc'):
-    """Capture and store today's options snapshot."""
-    from dotenv import load_dotenv
-    import os
-    from backtester.historical_data import HistoricalDataFetcher
-    
-    load_dotenv()
-    api_key = os.getenv('KAIKO_API_KEY')
-    
-    if not api_key:
-        print("ERROR: KAIKO_API_KEY not found")
-        return
-    
-    print(f"Capturing snapshot for {asset.upper()}...")
-    
-    fetcher = HistoricalDataFetcher(api_key)
-    storage = HistoricalStorage()
-    
-    # Fetch current data
-    data = fetcher.fetch_current_snapshot(asset, num_expiries=10)
-    spot_price = fetcher.client.get_spot_price(asset, 'usd')
-    
-    if data.empty:
-        print("ERROR: No data fetched")
-        return
-    
-    # Save to database
-    storage.save_snapshot(asset, data, spot_price)
-    
-    # Show stats
-    stats = storage.get_stats()
-    print(f"\n{'='*50}")
-    print("Database Statistics:")
-    print(f"  Total snapshots: {stats['num_snapshots']}")
-    print(f"  Total data points: {stats['num_datapoints']:,}")
-    print(f"  Date range: {stats['date_range'][0]} to {stats['date_range'][1]}")
-    print(f"  Assets: {', '.join(stats['assets'])}")
-    print(f"{'='*50}\n")
-
-
 if __name__ == "__main__":
     import sys
     
-    if len(sys.argv) > 1:
-        asset = sys.argv[1]
-    else:
-        asset = 'btc'
+    storage = HistoricalStorage()
     
-    capture_daily_snapshot(asset)
+    if len(sys.argv) > 1:
+        command = sys.argv[1]
+        
+        if command == 'stats':
+            stats = storage.get_stats()
+            print("\nDatabase Statistics:")
+            print(f"  Snapshots: {stats['num_snapshots']}")
+            print(f"  Data points: {stats['num_datapoints']:,}")
+            print(f"  Date range: {stats['date_range']}")
+            print(f"  Assets: {', '.join(stats['assets'])}\n")
+        
+        elif command == 'list':
+            snapshots = storage.list_snapshots()
+            print("\nAvailable Snapshots:")
+            print(snapshots.to_string(index=False))
+        
+        else:
+            print(f"Unknown command: {command}")
+            print("Usage: python historical_storage.py [stats|list]")
+    else:
+        print("Historical Storage initialized")
+        print(f"Database: {storage.db_path}")
