@@ -1,13 +1,12 @@
 """
 Store and retrieve historical options snapshots for backtesting.
-SQLite database with proper type handling and error management.
+SQLite database with safe upsert logic and proper timestamp handling.
 """
 import pandas as pd
 import sqlite3
 import os
 from datetime import datetime
 from typing import Optional, List
-import json
 
 
 class HistoricalStorage:
@@ -59,7 +58,7 @@ class HistoricalStorage:
                 theta REAL,
                 rho REAL,
                 open_interest REAL,
-                FOREIGN KEY (snapshot_id) REFERENCES snapshots(id)
+                FOREIGN KEY (snapshot_id) REFERENCES snapshots(id) ON DELETE CASCADE
             )
         """)
         
@@ -83,39 +82,67 @@ class HistoricalStorage:
         conn.close()
     
     def save_snapshot(self, asset: str, data: pd.DataFrame, spot_price: float):
-        """Save a daily snapshot of options data."""
+        """
+        Save a daily snapshot of options data using safe upsert logic.
+        
+        Args:
+            asset: Asset code (e.g., 'btc', 'eth')
+            data: Options data DataFrame
+            spot_price: Current spot price
+        """
         snapshot_date = datetime.now().date()
         
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
         try:
-            # Insert or update snapshot metadata
+            # Check if snapshot already exists
             cursor.execute("""
-                INSERT OR REPLACE INTO snapshots 
-                (asset, snapshot_date, spot_price, num_instruments)
-                VALUES (?, ?, ?, ?)
-            """, (asset, str(snapshot_date), float(spot_price), len(data)))
-            
-            # Get the snapshot ID
-            cursor.execute("""
-                SELECT id FROM snapshots 
+                SELECT id FROM snapshots
                 WHERE asset = ? AND snapshot_date = ?
             """, (asset, str(snapshot_date)))
             
-            result = cursor.fetchone()
-            if not result:
-                conn.rollback()
-                print(f"✗ Failed to retrieve snapshot ID for {asset}")
-                return
+            existing = cursor.fetchone()
             
-            snapshot_id = result[0]
-            
-            # Delete existing options data for this snapshot (in case of re-run)
-            cursor.execute("""
-                DELETE FROM options_data 
-                WHERE snapshot_id = ?
-            """, (snapshot_id,))
+            if existing:
+                # Update existing snapshot
+                snapshot_id = existing[0]
+                
+                cursor.execute("""
+                    UPDATE snapshots
+                    SET spot_price = ?, num_instruments = ?
+                    WHERE id = ?
+                """, (float(spot_price), len(data), snapshot_id))
+                
+                # Delete old options data for this snapshot
+                cursor.execute("""
+                    DELETE FROM options_data
+                    WHERE snapshot_id = ?
+                """, (snapshot_id,))
+                
+                print(f"  Updating existing snapshot {snapshot_id}")
+            else:
+                # Insert new snapshot
+                cursor.execute("""
+                    INSERT INTO snapshots 
+                    (asset, snapshot_date, spot_price, num_instruments)
+                    VALUES (?, ?, ?, ?)
+                """, (asset, str(snapshot_date), float(spot_price), len(data)))
+                
+                # Get the new snapshot ID
+                cursor.execute("""
+                    SELECT id FROM snapshots
+                    WHERE asset = ? AND snapshot_date = ?
+                """, (asset, str(snapshot_date)))
+                
+                result = cursor.fetchone()
+                if not result:
+                    conn.rollback()
+                    print(f"✗ Failed to create snapshot for {asset}")
+                    return
+                
+                snapshot_id = result[0]
+                print(f"  Created new snapshot {snapshot_id}")
             
             # Prepare data for insertion
             data = data.copy()
@@ -124,7 +151,7 @@ class HistoricalStorage:
             if 'expiry' in data.columns:
                 data['expiry'] = data['expiry'].astype(str)
             
-            # Insert options data row by row
+            # Insert options data
             inserted = 0
             for _, row in data.iterrows():
                 try:
@@ -151,7 +178,7 @@ class HistoricalStorage:
                     ))
                     inserted += 1
                 except Exception as e:
-                    print(f"  Warning: Failed to insert row for {row.get('instrument')}: {e}")
+                    print(f"  Warning: Failed to insert {row.get('instrument')}: {e}")
                     continue
             
             conn.commit()
@@ -176,7 +203,16 @@ class HistoricalStorage:
             return None
     
     def get_snapshot(self, asset: str, date: str) -> Optional[pd.DataFrame]:
-        """Retrieve a specific snapshot by date."""
+        """
+        Retrieve a specific snapshot by date.
+        
+        Args:
+            asset: Asset code
+            date: Date string (YYYY-MM-DD)
+        
+        Returns:
+            DataFrame with options data, or None if not found
+        """
         conn = sqlite3.connect(self.db_path)
         
         try:
@@ -208,11 +244,13 @@ class HistoricalStorage:
             df = pd.read_sql_query(query, conn, params=(snapshot_id,))
             
             if not df.empty:
+                # Add snapshot metadata
                 df['spot_price'] = spot_price
                 df['snapshot_date'] = date
                 df['snapshot_timestamp'] = pd.Timestamp(date, tz='UTC')
+                df['timestamp'] = df['snapshot_timestamp']  # Alias for compatibility
                 
-                # Convert expiry back to datetime
+                # Parse expiry as UTC-aware datetime
                 df['expiry'] = pd.to_datetime(df['expiry'], utc=True, errors='coerce')
             
             return df
@@ -221,7 +259,17 @@ class HistoricalStorage:
             conn.close()
     
     def get_date_range(self, asset: str, start_date: str, end_date: str) -> pd.DataFrame:
-        """Get all snapshots in a date range."""
+        """
+        Get all snapshots in a date range.
+        
+        Args:
+            asset: Asset code
+            start_date: Start date (YYYY-MM-DD)
+            end_date: End date (YYYY-MM-DD)
+        
+        Returns:
+            Combined DataFrame with all snapshots in range
+        """
         conn = sqlite3.connect(self.db_path)
         
         try:
@@ -247,8 +295,11 @@ class HistoricalStorage:
             )
             
             if not df.empty:
-                # Convert timestamp columns
+                # Add timestamp columns
                 df['snapshot_timestamp'] = pd.to_datetime(df['snapshot_date'], utc=True)
+                df['timestamp'] = df['snapshot_timestamp']  # Alias
+                
+                # Parse expiry as UTC-aware datetime
                 df['expiry'] = pd.to_datetime(df['expiry'], utc=True, errors='coerce')
             
             return df
@@ -304,7 +355,7 @@ class HistoricalStorage:
             date_range = cursor.fetchone()
             
             # Get assets
-            cursor.execute("SELECT DISTINCT asset FROM snapshots")
+            cursor.execute("SELECT DISTINCT asset FROM snapshots ORDER BY asset")
             assets = [row[0] for row in cursor.fetchall()]
             
             return {
@@ -335,7 +386,7 @@ class HistoricalStorage:
             
             snapshot_id = result[0]
             
-            # Delete options data
+            # Delete options data (cascade should handle this, but be explicit)
             cursor.execute("DELETE FROM options_data WHERE snapshot_id = ?", (snapshot_id,))
             
             # Delete snapshot
@@ -355,7 +406,12 @@ class HistoricalStorage:
 
 
 class BacktestRunner:
-    """Run backtests on historical snapshot data."""
+    """
+    Run signal generation on historical snapshot data.
+    
+    Note: This runner generates signals only. It does NOT simulate trades
+    or calculate P&L unless real mark-to-mark execution logic is added.
+    """
     
     def __init__(self, storage: HistoricalStorage):
         self.storage = storage
@@ -368,33 +424,42 @@ class BacktestRunner:
         end_date: str
     ) -> dict:
         """
-        Run a backtest using historical snapshots.
+        Run signal generation on historical snapshots.
+        
+        This generates trading signals on each historical snapshot.
+        It does NOT simulate trade execution or calculate P&L.
         
         Args:
             strategy: Strategy instance
-            asset: Asset to backtest
+            asset: Asset to analyze
             start_date: Start date (YYYY-MM-DD)
             end_date: End date (YYYY-MM-DD)
         
         Returns:
-            Backtest results dictionary
+            Dictionary with signals and statistics
         """
         from .strategies import SignalType  # Import here to avoid circular dependency
         
         print(f"\n{'='*70}")
-        print(f"BACKTESTING: {strategy.name}")
+        print(f"HISTORICAL SIGNAL GENERATION: {strategy.name}")
         print(f"{'='*70}")
         print(f"Asset: {asset.upper()}")
-        print(f"Period: {start_date} to {end_date}\n")
+        print(f"Period: {start_date} to {end_date}")
+        print(f"\nNote: This generates signals only, not P&L.\n")
         
         # Get historical data
         historical_data = self.storage.get_date_range(asset, start_date, end_date)
         
         if historical_data.empty:
-            return {'error': 'No historical data found for this period'}
+            return {
+                'error': 'No historical data found for this period',
+                'asset': asset,
+                'start_date': start_date,
+                'end_date': end_date
+            }
         
         print(f"✓ Loaded {len(historical_data)} historical data points")
-        print(f"  Unique dates: {historical_data['snapshot_date'].nunique()}")
+        print(f"  Unique dates: {historical_data['snapshot_date'].nunique()}\n")
         
         # Group by date and run strategy on each day
         all_signals = []
@@ -402,30 +467,36 @@ class BacktestRunner:
         for date in sorted(historical_data['snapshot_date'].unique()):
             day_data = historical_data[historical_data['snapshot_date'] == date].copy()
             
-            # Create spot data
+            # Get spot price for this day
             spot_price = day_data['spot_price'].iloc[0]
+            
+            # Create spot data DataFrame with UTC-aware timestamp
             spot_data = pd.DataFrame({
                 'timestamp': [pd.Timestamp(date, tz='UTC')],
                 'price': [spot_price]
             })
             
-            # Add timestamp to market data
+            # Ensure market data has proper timestamp
             day_data['timestamp'] = pd.Timestamp(date, tz='UTC')
+            day_data['snapshot_timestamp'] = pd.Timestamp(date, tz='UTC')
             
             # Generate signals
             try:
                 signals = strategy.generate_signals(day_data, spot_data)
                 
                 if signals:
-                    print(f"  {date}: Generated {len(signals)} signals @ ${spot_price:,.0f}")
+                    print(f"  {date}: {len(signals)} signals @ ${spot_price:,.0f}")
                     all_signals.extend(signals)
+                else:
+                    print(f"  {date}: No signals @ ${spot_price:,.0f}")
+                    
             except Exception as e:
-                print(f"  {date}: Error generating signals: {e}")
+                print(f"  {date}: Error - {e}")
                 continue
         
-        # Calculate performance
+        # Summarize results
         print(f"\n{'='*70}")
-        print("BACKTEST RESULTS")
+        print("SIGNAL GENERATION RESULTS")
         print(f"{'='*70}")
         print(f"Total Signals: {len(all_signals)}")
         
@@ -444,6 +515,7 @@ class BacktestRunner:
                 'strike': s.strike,
                 'option_type': s.option_type,
                 'iv': s.iv,
+                'spot_price': s.spot_price,
                 'reason': s.reason
             } for s in all_signals])
             
@@ -451,17 +523,21 @@ class BacktestRunner:
             print(signal_df.groupby(['action', 'option_type']).size())
         else:
             signal_df = pd.DataFrame()
+            print("\nNo signals generated in this period.")
+        
+        print(f"{'='*70}\n")
         
         return {
             'signals': all_signals,
             'signal_df': signal_df,
             'num_signals': len(all_signals),
             'date_range': (start_date, end_date),
-            'num_days': historical_data['snapshot_date'].nunique()
+            'num_days': historical_data['snapshot_date'].nunique(),
+            'asset': asset
         }
 
 
-# CLI tool for capturing daily snapshots
+# CLI tool
 if __name__ == "__main__":
     import sys
     
@@ -481,11 +557,17 @@ if __name__ == "__main__":
         elif command == 'list':
             snapshots = storage.list_snapshots()
             print("\nAvailable Snapshots:")
-            print(snapshots.to_string(index=False))
+            if not snapshots.empty:
+                print(snapshots.to_string(index=False))
+            else:
+                print("  (none)")
         
         else:
             print(f"Unknown command: {command}")
             print("Usage: python historical_storage.py [stats|list]")
     else:
-        print("Historical Storage initialized")
+        print("Historical Storage Module")
         print(f"Database: {storage.db_path}")
+        print("\nUsage:")
+        print("  python historical_storage.py stats  - Show database statistics")
+        print("  python historical_storage.py list   - List all snapshots")
