@@ -27,45 +27,16 @@ class HistoricalDataFetcher:
         end_date: str,
         exchange: str = "drbt"
     ) -> pd.DataFrame:
-        """Fetch historical options data with risk metrics."""
-        print(f"  Fetching options data for {asset.upper()}...")
+        """
+        Fetch historical options data.
         
-        start_dt = pd.to_datetime(start_date)
-        end_dt = pd.to_datetime(end_date)
-        
-        expiries = self.client.get_expiries(
-            base=asset,
-            quote='usd',
-            start_date=start_dt,
-            end_date=end_dt + timedelta(days=90),
-            exchange=exchange
+        NOTE: This method is NOT implemented for real historical time series.
+        Use HistoricalStorage.get_date_range() to retrieve stored daily snapshots.
+        """
+        raise NotImplementedError(
+            "True historical options time series not available. "
+            "Use HistoricalStorage to access stored snapshots instead."
         )
-        
-        if not expiries:
-            print(f"    No expiries found for {asset}")
-            return pd.DataFrame()
-        
-        print(f"    Found {len(expiries)} expiries")
-        
-        all_data = self.client.get_multi_expiry_options_data(
-            base=asset,
-            quote='usd',
-            expiries=expiries[:5],
-            exchange=exchange,
-            atm_filter_pct=0.3
-        )
-        
-        if all_data.empty:
-            print(f"    No options data retrieved")
-            return pd.DataFrame()
-        
-        # Fix timestamps
-        all_data['timestamp'] = pd.Timestamp.now(tz='UTC')
-        all_data['expiry'] = pd.to_datetime(all_data['expiry'], utc=True)
-        
-        print(f"    Retrieved {len(all_data)} instruments")
-        
-        return all_data
     
     def fetch_spot_price_history(
         self,
@@ -73,35 +44,17 @@ class HistoricalDataFetcher:
         start_date: str,
         end_date: str
     ) -> pd.DataFrame:
-        """Fetch spot price history."""
-        print(f"  Fetching spot prices for {asset.upper()}...")
+        """
+        Fetch spot price history.
         
-        current_price = self.client.get_spot_price(base=asset, quote='usd')
-        
-        if not current_price:
-            print(f"    Could not fetch spot price")
-            return pd.DataFrame()
-        
-        print(f"    Current price: ${current_price:,.2f}")
-        
-        start_dt = pd.to_datetime(start_date)
-        end_dt = pd.to_datetime(end_date)
-        
-        dates = pd.date_range(start=start_dt, end=end_dt, freq='h', tz='UTC')
-        
-        import numpy as np
-        np.random.seed(42)
-        returns = np.random.randn(len(dates)) * 0.02
-        prices = current_price * np.exp(np.cumsum(returns))
-        
-        df = pd.DataFrame({
-            'timestamp': dates,
-            'price': prices
-        })
-        
-        print(f"    Generated {len(df)} hourly price points")
-        
-        return df
+        NOTE: This currently raises NotImplementedError.
+        Use HistoricalStorage to get real snapshot-based spot prices.
+        """
+        raise NotImplementedError(
+            "Historical spot price time series not implemented. "
+            "Use HistoricalStorage.get_date_range() to retrieve "
+            "spot prices from stored snapshots instead."
+        )
     
     def fetch_current_snapshot(
         self,
@@ -112,8 +65,8 @@ class HistoricalDataFetcher:
         """Fetch current snapshot of options data for analysis."""
         print(f"  Fetching current snapshot for {asset.upper()}...")
         
-        today = datetime.now()
-        future = today + timedelta(days=90)
+        today = pd.Timestamp.now(tz='UTC')
+        future = today + pd.Timedelta(days=90)
         
         expiries = self.client.get_expiries(
             base=asset,
@@ -140,8 +93,20 @@ class HistoricalDataFetcher:
         
         if not data.empty:
             # Fix timestamps
+            snapshot_ts = pd.Timestamp.now(tz='UTC')
+            data['snapshot_timestamp'] = snapshot_ts
             data['expiry'] = pd.to_datetime(data['expiry'], utc=True)
             print(f"    Retrieved {len(data)} instruments")
+            
+            # Validate data
+            try:
+                from .validation import DataValidator
+                DataValidator.validate_and_report(data, f"{asset.upper()} Snapshot")
+            except ImportError:
+                # Validation module not available, skip
+                pass
+            except Exception as e:
+                print(f"    ⚠️  Validation warning: {e}")
             
         return data
 

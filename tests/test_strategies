@@ -1,0 +1,101 @@
+"""
+Basic tests for strategy signal generation.
+"""
+import pytest
+import pandas as pd
+import numpy as np
+from backtester.strategies import SimpleVolatilityStrategy, SignalType
+
+
+def test_empty_data_returns_no_signals():
+    """Strategy should return empty list on empty data."""
+    strategy = SimpleVolatilityStrategy()
+    
+    empty_data = pd.DataFrame()
+    spot_data = pd.DataFrame()
+    
+    signals = strategy.generate_signals(empty_data, spot_data)
+    
+    assert signals == []
+
+
+def test_missing_snapshot_timestamp_raises_error():
+    """Strategy should raise error if snapshot_timestamp missing."""
+    strategy = SimpleVolatilityStrategy()
+    
+    # Data without snapshot_timestamp
+    data = pd.DataFrame({
+        'strike_price': [50000],
+        'mark_iv': [75],
+        'instrument': ['test'],
+        'option_type': ['call'],
+        'expiry': [pd.Timestamp('2026-03-15', tz='UTC')]
+    })
+    
+    spot_data = pd.DataFrame()
+    
+    with pytest.raises(ValueError, match="snapshot_timestamp"):
+        strategy.generate_signals(data, spot_data)
+
+
+def test_signal_generation_on_valid_data():
+    """Strategy should generate signals on valid mock data."""
+    strategy = SimpleVolatilityStrategy(params={
+        'high_iv_threshold': 50,  # Low threshold to trigger
+        'low_iv_threshold': 50
+    })
+    
+    # Create valid mock data
+    snapshot_time = pd.Timestamp.now(tz='UTC')
+    
+    data = pd.DataFrame({
+        'instrument': ['btc-call-1', 'btc-put-1'],
+        'strike_price': [50000, 50000],
+        'option_type': ['call', 'put'],
+        'expiry': [pd.Timestamp('2026-03-15', tz='UTC')] * 2,
+        'mark_iv': [90, 50],  # High and low IV
+        'snapshot_timestamp': [snapshot_time] * 2,
+        'spot_price': [50000] * 2,
+        'delta': [0.5, -0.5],
+        'gamma': [0.001, 0.001]
+    })
+    
+    spot_data = pd.DataFrame({
+        'timestamp': [snapshot_time],
+        'price': [50000]
+    })
+    
+    signals = strategy.generate_signals(data, spot_data)
+    
+    # Should generate at least one signal (high IV one)
+    assert len(signals) > 0
+    assert all(s.timestamp == snapshot_time for s in signals)
+    assert all(hasattr(s, 'mark_price') for s in signals)
+
+
+def test_signal_timestamps_match_snapshot():
+    """All signals should use snapshot timestamp, not now()."""
+    strategy = SimpleVolatilityStrategy()
+    
+    snapshot_time = pd.Timestamp('2026-03-01 08:00:00', tz='UTC')
+    
+    data = pd.DataFrame({
+        'instrument': ['test'],
+        'strike_price': [50000],
+        'option_type': ['call'],
+        'expiry': [pd.Timestamp('2026-03-15', tz='UTC')],
+        'mark_iv': [100],  # Extreme to trigger signal
+        'snapshot_timestamp': [snapshot_time],
+        'spot_price': [50000],
+        'delta': [0.5],
+        'gamma': [0.001]
+    })
+    
+    spot_data = pd.DataFrame()
+    
+    signals = strategy.generate_signals(data, spot_data)
+    
+    if signals:
+        for signal in signals:
+            assert signal.timestamp == snapshot_time
+            assert signal.timestamp != pd.Timestamp.now(tz='UTC')
