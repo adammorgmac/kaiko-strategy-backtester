@@ -49,8 +49,8 @@ def analyze_current_options(api_key: str):
     print(f"  Max IV: {market_data['mark_iv'].max():.1f}%")
     
     # Define thresholds
-    HIGH_IV = avg_iv + 0.5 * iv_std  # Above average
-    LOW_IV = avg_iv - 0.5 * iv_std    # Below average
+    HIGH_IV = avg_iv + 0.3 * iv_std  # Above average
+    LOW_IV = avg_iv - 0.3 * iv_std    # Below average
     
     print(f"\nDefined Thresholds:")
     print(f"  High IV (sell threshold): >{HIGH_IV:.1f}%")

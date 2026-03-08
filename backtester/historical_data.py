@@ -27,21 +27,9 @@ class HistoricalDataFetcher:
         end_date: str,
         exchange: str = "drbt"
     ) -> pd.DataFrame:
-        """
-        Fetch historical options data with risk metrics.
-        
-        Args:
-            asset: 'btc' or 'eth'
-            start_date: 'YYYY-MM-DD'
-            end_date: 'YYYY-MM-DD'
-            exchange: Exchange code (default: drbt = Deribit)
-            
-        Returns:
-            DataFrame with options data including Greeks, OI, IV
-        """
+        """Fetch historical options data with risk metrics."""
         print(f"  Fetching options data for {asset.upper()}...")
         
-        # Get expiries in the date range
         start_dt = pd.to_datetime(start_date)
         end_dt = pd.to_datetime(end_date)
         
@@ -49,7 +37,7 @@ class HistoricalDataFetcher:
             base=asset,
             quote='usd',
             start_date=start_dt,
-            end_date=end_dt + timedelta(days=90),  # Look ahead for future expiries
+            end_date=end_dt + timedelta(days=90),
             exchange=exchange
         )
         
@@ -59,22 +47,21 @@ class HistoricalDataFetcher:
         
         print(f"    Found {len(expiries)} expiries")
         
-        # Fetch options data for recent expiries
-        # Use ATM filter to speed up (only get strikes near ATM)
         all_data = self.client.get_multi_expiry_options_data(
             base=asset,
             quote='usd',
-            expiries=expiries[:5],  # Limit to 5 expiries for speed
+            expiries=expiries[:5],
             exchange=exchange,
-            atm_filter_pct=0.3  # Only strikes within ±30% of ATM
+            atm_filter_pct=0.3
         )
         
         if all_data.empty:
             print(f"    No options data retrieved")
             return pd.DataFrame()
         
-        # Add timestamp (current snapshot)
-        all_data['timestamp'] = pd.Timestamp.now()
+        # Fix timestamps
+        all_data['timestamp'] = pd.Timestamp.now(tz='UTC')
+        all_data['expiry'] = pd.to_datetime(all_data['expiry'], utc=True)
         
         print(f"    Retrieved {len(all_data)} instruments")
         
@@ -86,18 +73,9 @@ class HistoricalDataFetcher:
         start_date: str,
         end_date: str
     ) -> pd.DataFrame:
-        """
-        Fetch spot price history.
-        
-        Note: For MVP, creates synthetic price history based on current price.
-        In production, would fetch actual historical OHLCV data.
-        
-        Returns:
-            DataFrame with columns: timestamp, price
-        """
+        """Fetch spot price history."""
         print(f"  Fetching spot prices for {asset.upper()}...")
         
-        # Get current spot price using existing method
         current_price = self.client.get_spot_price(base=asset, quote='usd')
         
         if not current_price:
@@ -106,17 +84,14 @@ class HistoricalDataFetcher:
         
         print(f"    Current price: ${current_price:,.2f}")
         
-        # Create time series (for MVP testing)
         start_dt = pd.to_datetime(start_date)
         end_dt = pd.to_datetime(end_date)
         
-        dates = pd.date_range(start=start_dt, end=end_dt, freq='1H')
+        dates = pd.date_range(start=start_dt, end=end_dt, freq='h', tz='UTC')
         
-        # Simulate some price movement (±2% random walk for testing)
-        # In production: Replace with actual historical data from Kaiko
         import numpy as np
-        np.random.seed(42)  # Reproducible
-        returns = np.random.randn(len(dates)) * 0.02  # 2% volatility
+        np.random.seed(42)
+        returns = np.random.randn(len(dates)) * 0.02
         prices = current_price * np.exp(np.cumsum(returns))
         
         df = pd.DataFrame({
@@ -134,20 +109,9 @@ class HistoricalDataFetcher:
         num_expiries: int = 3,
         exchange: str = 'drbt'
     ) -> pd.DataFrame:
-        """
-        Fetch current snapshot of options data for analysis.
-        
-        Args:
-            asset: 'btc' or 'eth'
-            num_expiries: Number of expiries to fetch (default: 3)
-            exchange: Exchange code
-            
-        Returns:
-            DataFrame with current options data
-        """
+        """Fetch current snapshot of options data for analysis."""
         print(f"  Fetching current snapshot for {asset.upper()}...")
         
-        # Get upcoming expiries
         today = datetime.now()
         future = today + timedelta(days=90)
         
@@ -163,26 +127,25 @@ class HistoricalDataFetcher:
             print("    No expiries found")
             return pd.DataFrame()
         
-        # Take the nearest expiries
         expiries_to_fetch = expiries[:num_expiries]
-        print(f"    Fetching {len(expiries_to_fetch)} expiries: {expiries_to_fetch}")
+        print(f"    Fetching {len(expiries_to_fetch)} expiries")
         
-        # Fetch with ATM filter for speed
         data = self.client.get_multi_expiry_options_data(
             base=asset,
             quote='usd',
             expiries=expiries_to_fetch,
             exchange=exchange,
-            atm_filter_pct=0.2  # ±20% of ATM
+            atm_filter_pct=0.2
         )
         
         if not data.empty:
+            # Fix timestamps
+            data['expiry'] = pd.to_datetime(data['expiry'], utc=True)
             print(f"    Retrieved {len(data)} instruments")
             
         return data
 
 
-# Test function
 if __name__ == "__main__":
     import os
     from dotenv import load_dotenv
@@ -192,7 +155,6 @@ if __name__ == "__main__":
     
     if not api_key:
         print("ERROR: KAIKO_API_KEY not found in .env file")
-        print("Please create a .env file with: KAIKO_API_KEY=your_key_here")
         sys.exit(1)
     
     print("✓ API key loaded")
@@ -203,61 +165,13 @@ if __name__ == "__main__":
     print("TESTING HISTORICAL DATA FETCHER")
     print("="*70 + "\n")
     
-    # Test 1: Fetch current snapshot
-    print("Test 1: Current options snapshot")
-    print("-" * 70)
     snapshot = fetcher.fetch_current_snapshot('btc', num_expiries=2)
     
     if not snapshot.empty:
         print(f"\n✓ Snapshot retrieved successfully")
         print(f"  Shape: {snapshot.shape}")
         print(f"  Columns: {snapshot.columns.tolist()}")
-        
-        print(f"\n  Sample instruments:")
-        sample_cols = ['instrument', 'strike_price', 'option_type', 'expiry', 
-                       'mark_iv', 'delta', 'gamma', 'open_interest']
-        available_cols = [col for col in sample_cols if col in snapshot.columns]
-        
-        if available_cols:
-            print(snapshot[available_cols].head(10).to_string(index=False))
-        else:
-            print(snapshot.head())
-    else:
-        print("\n✗ No snapshot data retrieved")
-    
-    # Test 2: Spot prices
-    print("\n" + "="*70)
-    print("Test 2: Spot price history")
-    print("-" * 70)
-    
-    end_date = datetime.now().strftime('%Y-%m-%d')
-    start_date = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
-    
-    spot_data = fetcher.fetch_spot_price_history('btc', start_date, end_date)
-    
-    if not spot_data.empty:
-        print(f"\n✓ Spot data generated successfully")
-        print(f"  Shape: {spot_data.shape}")
-        print(f"  Date range: {spot_data['timestamp'].min()} to {spot_data['timestamp'].max()}")
-        print(f"  Price range: ${spot_data['price'].min():,.2f} - ${spot_data['price'].max():,.2f}")
-        print(f"\n  Sample prices:")
-        print(spot_data.head(10).to_string(index=False))
-    else:
-        print("\n✗ No spot data retrieved")
-    
-    # Test 3: Historical options data
-    print("\n" + "="*70)
-    print("Test 3: Historical options data")
-    print("-" * 70)
-    
-    hist_data = fetcher.fetch_historical_options_data('btc', start_date, end_date)
-    
-    if not hist_data.empty:
-        print(f"\n✓ Historical data retrieved successfully")
-        print(f"  Shape: {hist_data.shape}")
-        print(f"  Expiries: {hist_data['expiry'].unique().tolist()}")
-    else:
-        print("\n✗ No historical data retrieved")
+        print(f"  Expiry dtype: {snapshot['expiry'].dtype}")
     
     print("\n" + "="*70)
     print("TESTING COMPLETE!")
